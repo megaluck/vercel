@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ZEN mentions — last 24h</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    body { max-width: 720px; margin: 4rem auto; padding: 0 1rem; }
+    .card { border: 1px solid #e5e5e5; border-radius: 14px; padding: 1.25rem; box-shadow: 0 2px 12px rgba(0,0,0,0.04); }
+    h1 { font-size: 1.25rem; margin: 0 0 0.5rem; }
+    .muted { color: #666; font-size: 0.95rem; }
+    .row { display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; }
+    .big { font-size: 2.5rem; font-weight: 700; letter-spacing: -0.02em; }
+    .chip { background: #f4f4f4; border-radius: 999px; padding: 0.15rem 0.6rem; font-size: 0.85rem; }
+    button { border: 1px solid #ddd; border-radius: 10px; padding: 0.5rem 0.75rem; background: white; cursor: pointer; }
+    button:hover { background: #f9f9f9; }
+    canvas { width: 100%; height: 120px; display: block; }
+    .footer { margin-top: 0.5rem; font-size: 0.85rem; color: #777; }
+    .err { color: #b00020; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>ZEN mentions in the last 24 hours</h1>
+    <div class="row">
+      <div id="total" class="big">—</div>
+      <span class="chip" id="qchip"></span>
+      <button id="refreshBtn">Refresh</button>
+      <button id="forceBtn" title="Bypass CDN cache">Force</button>
+    </div>
+    <canvas id="chart" width="700" height="140"></canvas>
+    <div id="status" class="footer muted">Loading…</div>
+    <div id="error" class="footer err"></div>
+  </div>
+
+  <script>
+    const API_BASE = '/api/x-count';
+    const DEFAULT_Q = '#21MWITHPRIVACY -is:retweet'; // change to '#ZEN -is:retweet' if you prefer
+
+    const totalEl = document.getElementById('total');
+    const statusEl = document.getElementById('status');
+    const errorEl = document.getElementById('error');
+    const chipEl = document.getElementById('qchip');
+    const canvas = document.getElementById('chart');
+    const ctx = canvas.getContext('2d');
+
+    document.getElementById('refreshBtn').addEventListener('click', () => fetchCount(false));
+    document.getElementById('forceBtn').addEventListener('click', () => fetchCount(true));
+
+    async function fetchCount(force) {
+      errorEl.textContent = '';
+      statusEl.textContent = 'Loading…';
+      totalEl.textContent = '—';
+
+      try {
+        const url = new URL(API_BASE, location.origin);
+        url.searchParams.set('q', DEFAULT_Q);
+        if (force) url.searchParams.set('_', Date.now()); // cache-buster
+
+        const r = await fetch(url.toString());
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const json = await r.json();
+
+        chipEl.textContent = json.query;
+        totalEl.textContent = json.total === null ? '—' : json.total.toLocaleString();
+        drawBars(json.per_hour || []);
+
+        const start = new Date(json.start_time);
+        const end = new Date(json.end_time);
+        const note = json.note ? ` • ${json.note}` : '';
+        statusEl.textContent = `From ${start.toLocaleString()} to ${end.toLocaleString()} • Cached ≤15 min${note}`;
+      } catch (e) {
+        console.error(e);
+        errorEl.textContent = 'Failed to load. Check API/token.';
+        statusEl.textContent = '';
+      }
+    }
+
+    function drawBars(buckets) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const values = buckets.map(b => b.count);
+      const max = Math.max(1, ...values);
+      const pad = 12, w = canvas.width - pad * 2, h = canvas.height - pad * 2;
+      const gap = 4, n = values.length;
+      const barW = (w - gap * (n - 1)) / n;
+
+      ctx.beginPath();
+      ctx.moveTo(pad, canvas.height - pad + 0.5);
+      ctx.lineTo(canvas.width - pad, canvas.height - pad + 0.5);
+      ctx.strokeStyle = '#ddd';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      ctx.fillStyle = '#4a67ff';
+      values.forEach((v, i) => {
+        const x = pad + i * (barW + gap);
+        const barH = (v / max) * h;
+        const y = canvas.height - pad - barH;
+        ctx.fillRect(x, y, barW, barH);
+      });
+    }
+
+    fetchCount(false);
+  </script>
+</body>
+</html>
