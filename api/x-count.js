@@ -1,42 +1,44 @@
 // /api/x-count.js
-// Env var required in Vercel: X_BEARER_TOKEN (X/Twitter API v2 Bearer token)
+// Env var: X_BEARER_TOKEN
 
-const FIFTEEN_MIN = 15 * 60 * 1000;      // 15 minutes (ms)
-const STALE_REVALIDATE_SEC = 60;         // allow brief background refresh
-const BUFFER_MS = 15 * 1000;             // 15-second safety buffer for end_time
+const FIFTEEN_MIN = 15 * 60 * 1000; // 15 min
+const STALE_REVALIDATE_SEC = 60;    // background refresh hint
+const BUFFER_MS = 15 * 1000;        // 15s safety for end_time
 
-// Simple per-query in-memory cache { q: { timestamp, payload } }
-const cache = new Map();
+// Simple per-query cache + rate info
+const cache = new Map(); // q -> { timestamp, payload, rateLockedUntil? }
 
 export default async function handler(req, res) {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Expose-Headers', 'x-vercel-cache, age');
+  res.setHeader('Access-Control-Expose-Headers', 'x-vercel-cache, age, retry-after');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // HTTP cache (Vercel Edge/CDN)
-  res.setHeader(
-    'Cache-Control',
-    `public, s-maxage=${FIFTEEN_MIN / 1000}, stale-while-revalidate=${STALE_REVALIDATE_SEC}`
-  );
+  // CDN cache (Vercel)
+  res.setHeader('Cache-Control', `public, s-maxage=${FIFTEEN_MIN / 1000}, stale-while-revalidate=${STALE_REVALIDATE_SEC}`);
   res.setHeader('CDN-Cache-Control', `public, s-maxage=${FIFTEEN_MIN / 1000}`);
 
-  // Query to count (default is cashtag $ZEN). Examples:
-  //   q=$ZEN                      (cashtag)
-  //   q=#ZEN                      (hashtag)
-  //   q=$ZEN -is:retweet          (exclude retweets)
   const q = (req.query.q ?? '#21MWITHPRIVACY').toString();
-
-  // Use in-memory cache if still fresh
   const now = Date.now();
-  const cached = cache.get(q);
-  if (cached && now - cached.timestamp < FIFTEEN_MIN) {
-    return res.status(200).json(cached.payload);
+  const entry = cache.get(q);
+
+  // If we’re within our 15-min freshness window OR under a rate lock, serve cache if we have it
+  if (entry?.payload) {
+    const fresh = now - entry.timestamp < FIFTEEN_MIN;
+    const rateLocked = entry.rateLockedUntil && now < entry.rateLockedUntil;
+    if (fresh || rateLocked) {
+      if (rateLocked) {
+        // Tell clients when it's safe to try again (best-effort)
+        const retrySec = Math.max(1, Math.ceil((entry.rateLockedUntil - now) / 1000));
+        res.setHeader('Retry-After', String(retrySec));
+      }
+      return res.status(200).json(entry.payload);
+    }
   }
 
-  // Build 24h window with a small buffer for end_time (API requires >=10s in the past)
-  const end = new Date(Date.now() - BUFFER_MS);
+  // Build 24h window with a small buffer
+  const end = new Date(now - BUFFER_MS);
   const start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
 
   const params = new URLSearchParams({
@@ -51,16 +53,45 @@ export default async function handler(req, res) {
       headers: { Authorization: `Bearer ${process.env.X_BEARER_TOKEN}` }
     });
 
-    if (!r.ok) {
-      // If API fails but we have stale cache, serve that instead
-      if (cached) return res.status(200).json(cached.payload);
-      const text = await r.text();
-      return res
-        .status(r.status)
-        .json({ error: 'X API error', status: r.status, detail: text });
+    if (r.status === 429) {
+      // Respect X rate limit reset if provided; otherwise back off 15 min
+      const retryAfterHdr = r.headers.get('retry-after');
+      const resetHdr = r.headers.get('x-rate-limit-reset'); // unix seconds (if present)
+      let retryMs = FIFTEEN_MIN;
+
+      if (retryAfterHdr && !Number.isNaN(Number(retryAfterHdr))) {
+        retryMs = Math.max(5_000, Number(retryAfterHdr) * 1000);
+      } else if (resetHdr && !Number.isNaN(Number(resetHdr))) {
+        const resetMs = Number(resetHdr) * 1000 - now;
+        if (resetMs > 0) retryMs = Math.max(5_000, resetMs);
+      }
+
+      // Set/extend rate lock and serve stale if we have it
+      const rateLockedUntil = now + retryMs;
+      if (entry) {
+        entry.rateLockedUntil = rateLockedUntil;
+        cache.set(q, entry);
+        res.setHeader('Retry-After', String(Math.ceil(retryMs / 1000)));
+        return res.status(200).json(entry.payload); // stale-but-usable
+      }
+
+      // No cache to fall back to — return a friendly 429 with guidance
+      res.setHeader('Retry-After', String(Math.ceil(retryMs / 1000)));
+      return res.status(429).json({
+        error: 'rate_limited',
+        detail: 'X API rate limit hit. Try again later.',
+        retry_after_seconds: Math.ceil(retryMs / 1000)
+      });
     }
 
-    const data = await r.json(); // { data: [{start,end,tweet_count}], meta: {...} }
+    if (!r.ok) {
+      // Non-429 error: serve stale if possible
+      if (entry?.payload) return res.status(200).json(entry.payload);
+      const text = await r.text();
+      return res.status(r.status).json({ error: 'X API error', status: r.status, detail: text });
+    }
+
+    const data = await r.json();
     const perHour = (data.data ?? []).map(b => ({
       start: b.start,
       end: b.end,
@@ -76,11 +107,11 @@ export default async function handler(req, res) {
       per_hour: perHour
     };
 
-    cache.set(q, { timestamp: now, payload });
+    cache.set(q, { timestamp: now, payload, rateLockedUntil: null });
     return res.status(200).json(payload);
   } catch (e) {
-    // Network/other error: fall back to stale cache if available
-    if (cached) return res.status(200).json(cached.payload);
+    // Network or other error: serve stale if available
+    if (entry?.payload) return res.status(200).json(entry.payload);
     return res.status(500).json({ error: 'server_error', detail: String(e) });
   }
 }
