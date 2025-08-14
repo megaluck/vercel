@@ -1,10 +1,11 @@
 // /api/x-count.js
-// Env var required: X_BEARER_TOKEN (X/Twitter API v2 Bearer token)
+// Env var required in Vercel: X_BEARER_TOKEN (X/Twitter API v2 Bearer token)
 
-const FIFTEEN_MIN = 15 * 60 * 1000;
-const STALE_REVALIDATE_SEC = 60;
+const FIFTEEN_MIN = 15 * 60 * 1000;      // 15 minutes (ms)
+const STALE_REVALIDATE_SEC = 60;         // allow brief background refresh
+const BUFFER_MS = 15 * 1000;             // 15-second safety buffer for end_time
 
-// simple per-query in-memory cache { [q]: { timestamp, payload } }
+// Simple per-query in-memory cache { q: { timestamp, payload } }
 const cache = new Map();
 
 export default async function handler(req, res) {
@@ -14,27 +15,32 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Expose-Headers', 'x-vercel-cache, age');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // HTTP cache for Vercel CDN (15 min)
-  // s-maxage is respected by Vercel's CDN; stale-while-revalidate allows brief background revalidation
-  res.setHeader('Cache-Control', `public, s-maxage=${FIFTEEN_MIN / 1000}, stale-while-revalidate=${STALE_REVALIDATE_SEC}`);
+  // HTTP cache (Vercel Edge/CDN)
+  res.setHeader(
+    'Cache-Control',
+    `public, s-maxage=${FIFTEEN_MIN / 1000}, stale-while-revalidate=${STALE_REVALIDATE_SEC}`
+  );
   res.setHeader('CDN-Cache-Control', `public, s-maxage=${FIFTEEN_MIN / 1000}`);
 
-  const q = (req.query.q ?? '#21MWITHPRIVACY').toString(); // cashtag by default
+  // Query to count (default is cashtag $ZEN). Examples:
+  //   q=$ZEN                      (cashtag)
+  //   q=#ZEN                      (hashtag)
+  //   q=$ZEN -is:retweet          (exclude retweets)
+  const q = (req.query.q ?? '#21MWITHPRIVACY').toString();
+
+  // Use in-memory cache if still fresh
   const now = Date.now();
   const cached = cache.get(q);
-
-  // Serve warm in-memory cache (avoid hitting X within 15 min)
   if (cached && now - cached.timestamp < FIFTEEN_MIN) {
     return res.status(200).json(cached.payload);
   }
 
-  // Compute 24h window
-  const end = new Date();
+  // Build 24h window with a small buffer for end_time (API requires >=10s in the past)
+  const end = new Date(Date.now() - BUFFER_MS);
   const start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
 
-  // Build query for X v2 counts
   const params = new URLSearchParams({
-    query: q,                // e.g. "$ZEN" or "#ZEN -is:retweet"
+    query: q,
     granularity: 'hour',
     start_time: start.toISOString(),
     end_time: end.toISOString()
@@ -46,13 +52,15 @@ export default async function handler(req, res) {
     });
 
     if (!r.ok) {
-      // fallback to stale cache if we have it
+      // If API fails but we have stale cache, serve that instead
       if (cached) return res.status(200).json(cached.payload);
       const text = await r.text();
-      return res.status(r.status).json({ error: 'X API error', status: r.status, detail: text });
+      return res
+        .status(r.status)
+        .json({ error: 'X API error', status: r.status, detail: text });
     }
 
-    const data = await r.json(); // { data: [{start, end, tweet_count}], meta: { ... } }
+    const data = await r.json(); // { data: [{start,end,tweet_count}], meta: {...} }
     const perHour = (data.data ?? []).map(b => ({
       start: b.start,
       end: b.end,
@@ -71,7 +79,7 @@ export default async function handler(req, res) {
     cache.set(q, { timestamp: now, payload });
     return res.status(200).json(payload);
   } catch (e) {
-    // fallback to stale cache if network fails
+    // Network/other error: fall back to stale cache if available
     if (cached) return res.status(200).json(cached.payload);
     return res.status(500).json({ error: 'server_error', detail: String(e) });
   }
